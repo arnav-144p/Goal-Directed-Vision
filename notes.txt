@@ -1,4 +1,0 @@
-CLIP = constrastive Language Image Pretraining built by OpenATI
-   Learns: 1. Image Encoder, 2.Text encoder, 3.Align both using constrastive loss(A loss function which brings similar examples together and dissimilar farther)
-   uses: 1.Scan path generation
-

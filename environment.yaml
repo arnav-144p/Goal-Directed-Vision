@@ -1,0 +1,47 @@
+name: activevision_cpu
+channels:
+  - defaults
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - torch
+    - torchvision
+    - torchaudio
+    - numpy
+    - scipy
+    - pandas
+    - matplotlib
+    - seaborn
+    - scikit-learn
+    - scikit-image
+    - opencv-python
+    - tqdm
+    - pyyaml
+    - docopt
+    - timm
+    - einops
+    - transformers
+    - sentence-transformers
+    - ftfy
+    - regex
+    - requests
+    - pillow
+    - joblib
+    - addict
+    - cloudpickle
+    - cython
+    - imageio
+    - protobuf
+    - yacs
+    - hydra-core
+    - fvcore
+    - iopath
+    - tabulate
+    - rich
+    - yapf
+    - black
+
+#Conda env create -f environment.yaml

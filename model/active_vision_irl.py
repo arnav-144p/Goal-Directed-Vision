@@ -11,6 +11,8 @@ coarse patch grid, while CLIP provides semantic feedback.
 The design mirrors the style of `interactive_search.py` but is organized into
 modular functions:
 
+
+
 - `load_irl_policy()`
 - `initial_state()`
 - `next_action()`

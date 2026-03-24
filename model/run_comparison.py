@@ -12,6 +12,7 @@ Usage:
 The output visualization is saved to `comparison_output.png` by default.
 """
 
+
 import argparse
 import os
 from typing import Tuple, List, Dict, Any

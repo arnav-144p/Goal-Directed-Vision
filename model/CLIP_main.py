@@ -29,6 +29,7 @@ def main():
     # image inputs
     ap.add_argument("--image", type=str, help="single image path")
     ap.add_argument("--dir", type=str, help="directory of images")
+
     ap.add_argument("--recursive", action="store_true", help="recurse into subdirs with --dir")
     ap.add_argument("--pattern", type=str, help="glob pattern like 'data/**/*.jpg'")
     ap.add_argument("--list", type=str, help="text file with one image path per line")

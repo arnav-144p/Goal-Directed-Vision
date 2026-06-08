@@ -40,6 +40,46 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+def encode_clip_query_embedding(
+    model,
+    tokenizer,
+    task_text: str,
+    device,
+) -> torch.Tensor:
+    """
+    Average CLIP text embeddings over simple prompt templates.
+
+    OpenAI CLIP / ViT-B-32 often matches better with "a photo of a …" style
+    prompts; averaging reduces confusion between visually similar categories.
+    """
+    t = (task_text or "").strip()
+    phrases = []
+    if t:
+        phrases.append(t)
+        phrases.append(f"a photo of a {t}")
+        phrases.append(f"a {t}")
+        phrases.append(f"photo of {t}")
+
+    seen = set()
+    uniq: List[str] = []
+    for p in phrases:
+        if p and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+
+    if not uniq:
+        uniq = ["object"]
+
+    tokens = tokenizer(uniq).to(device)
+    with torch.no_grad():
+        te = model.encode_text(tokens)
+        te = F.normalize(te, dim=-1)
+    # Mean then re-normalize (single query direction)
+    emb = te.mean(dim=0, keepdim=True)
+    emb = F.normalize(emb, dim=-1)
+    return emb
+
+
 def download_image(url: str, destination: pathlib.Path) -> pathlib.Path:
     """Download image from URL"""
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -64,10 +104,18 @@ def load_image(image_input: str) -> Image.Image:
         image_path = download_image(image_input, temp_path)
         return Image.open(image_path).convert("RGB")
     else:
-        # Local file
-        if not os.path.exists(image_input):
-            raise FileNotFoundError(f"Image not found: {image_input}")
-        return Image.open(image_input).convert("RGB")
+        # Local file: try provided path first, then common project-relative fallback.
+        if os.path.exists(image_input):
+            return Image.open(image_input).convert("RGB")
+
+        # If called from repo root (e.g., `python model/run_comparison.py`),
+        # users often pass `demo_inputs/...` while files live in `model/demo_inputs/...`.
+        module_dir = pathlib.Path(__file__).resolve().parent
+        fallback_path = module_dir / image_input
+        if fallback_path.exists():
+            return Image.open(fallback_path).convert("RGB")
+
+        raise FileNotFoundError(f"Image not found: {image_input}")
 
 
 def get_interactive_inputs():
@@ -136,11 +184,8 @@ def generate_saliency_map(image: Image.Image, task_text: str, model, tokenizer, 
     """Generate task-guided saliency map with better quality"""
     print("[INFO] Generating saliency map...")
     
-    # Get text embedding
-    text_tokens = tokenizer([task_text]).to(device)
-    with torch.no_grad():
-        text_emb = model.encode_text(text_tokens)
-        text_emb = F.normalize(text_emb, dim=-1)
+    # Multi-template text embedding (shared with active IRL + bbox refinement)
+    text_emb = encode_clip_query_embedding(model, tokenizer, task_text, device)
     
     # Use adaptive patch size based on image size
     w, h = image.size

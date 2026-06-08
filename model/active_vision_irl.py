@@ -46,6 +46,8 @@ from models.IRL.model.config import JsonConfig
 from models.IRL.model.models import LHF_Policy_Cond_Small
 from models.IRL.model.utils import action_to_pos, pos_to_action
 
+from interactive_search import encode_clip_query_embedding
+
 
 @dataclass
 class IRLState:
@@ -98,12 +100,24 @@ def load_irl_policy(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if not os.path.exists(hparams_path):
-        raise FileNotFoundError(f"IRL hparams file not found: {hparams_path}")
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    resolved_hparams_path = hparams_path
+    if not os.path.exists(resolved_hparams_path):
+        candidate = os.path.join(module_dir, hparams_path)
+        if os.path.exists(candidate):
+            resolved_hparams_path = candidate
+        else:
+            raise FileNotFoundError(f"IRL hparams file not found: {hparams_path}")
 
-    hparams = JsonConfig(hparams_path)
+    hparams = JsonConfig(resolved_hparams_path)
 
-    checkpoint_path = os.path.join(checkpoint_dir, "trained_generator.pkg")
+    resolved_checkpoint_dir = checkpoint_dir
+    if not os.path.exists(resolved_checkpoint_dir):
+        candidate = os.path.join(module_dir, checkpoint_dir)
+        if os.path.exists(candidate):
+            resolved_checkpoint_dir = candidate
+
+    checkpoint_path = os.path.join(resolved_checkpoint_dir, "trained_generator.pkg")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"IRL checkpoint not found: {checkpoint_path}")
 
@@ -215,6 +229,34 @@ def initial_state(
     )
 
 
+def seed_belief_from_saliency(irl_state: IRLState, saliency_hw: np.ndarray) -> None:
+    """
+    Downsample a full-resolution task saliency map onto the IRL patch grid.
+
+    Aligns active search with passive CLIP localization so both focus on the
+    same candidate region before IRL proposes refinements.
+    """
+    img_w, img_h = irl_state.image_size
+    patch_num_x, patch_num_y = irl_state.patch_num
+
+    sm = saliency_hw.astype(np.float32)
+    if sm.shape != (img_h, img_w):
+        sm_u8 = np.clip(sm, 0.0, 1.0)
+        pil = Image.fromarray((sm_u8 * 255.0).astype(np.uint8))
+        pil = pil.resize((img_w, img_h), Image.Resampling.BILINEAR)
+        sm = np.array(pil, dtype=np.float32) / 255.0
+
+    sm = np.clip(sm, 0.0, 1.0)
+    if sm.max() > sm.min():
+        sm = (sm - sm.min()) / (sm.max() - sm.min() + 1e-8)
+
+    # Patch grid: width = patch_num_x, height = patch_num_y → array shape (ny, nx)
+    pil_grid = Image.fromarray((sm * 255.0).astype(np.uint8))
+    pil_grid = pil_grid.resize((patch_num_x, patch_num_y), Image.Resampling.BILINEAR)
+    grid = np.array(pil_grid, dtype=np.float32) / 255.0
+    irl_state.belief_patch_map = grid
+
+
 def _build_feature_tensor_from_belief(
     belief_patch_map: np.ndarray,
     history_patch_map: np.ndarray,
@@ -306,6 +348,21 @@ def next_action(
         act_probs, _ = irl_policy(feature_batch, tid_batch, act_only=False)
 
     probs = act_probs[0]  # (patch_count,) – use the first (real) sample
+    
+    # Bias toward patches with high CLIP scores (good matches)
+    # This helps guide fixations toward the target object
+    belief_flat = torch.from_numpy(irl_state.belief_patch_map.flatten()).to(device)
+    # Normalize belief scores to [0, 1] range
+    if belief_flat.max() > belief_flat.min():
+        belief_flat = (belief_flat - belief_flat.min()) / (belief_flat.max() - belief_flat.min())
+    
+    # Combine IRL policy with CLIP-driven belief. Stronger CLIP weight avoids
+    # IRL (trained on COCO-Search categories, dummy task id) overriding the text.
+    seeded = float(np.max(irl_state.belief_patch_map)) > 0.02
+    clip_weight = 0.72 if seeded else 0.5
+    irl_weight = 1.0 - clip_weight
+    probs = irl_weight * probs + clip_weight * belief_flat
+    
     if irl_state.visited_actions:
         # Mask previously visited actions
         mask = torch.ones_like(probs)
@@ -400,6 +457,7 @@ def evaluate_patch_with_clip(
     clip_preprocess,
     clip_tokenizer,
     device: torch.device,
+    text_emb: Optional[torch.Tensor] = None,
 ) -> float:
     """
     Evaluate a cropped patch with CLIP against the given text query.
@@ -427,9 +485,9 @@ def evaluate_patch_with_clip(
     clip_model.eval()
 
     with torch.no_grad():
-        text_tokens = clip_tokenizer([text_query]).to(device)
-        text_emb = clip_model.encode_text(text_tokens)
-        text_emb = F.normalize(text_emb, dim=-1)
+        if text_emb is None:
+            text_tokens = clip_tokenizer([text_query]).to(device)
+            text_emb = F.normalize(clip_model.encode_text(text_tokens), dim=-1)
 
         patch_tensor = clip_preprocess(patch).unsqueeze(0).to(device)
         image_emb = clip_model.encode_image(patch_tensor)
@@ -451,6 +509,9 @@ def update_state(
 
     The belief map is updated at the selected patch location with the new
     similarity score, and the history map is marked as visited.
+    
+    When CLIP score is high (indicating a good match), the score is propagated
+    to neighboring patches to guide future fixations toward the target object.
 
     Parameters
     ----------
@@ -478,8 +539,30 @@ def update_state(
     irl_state.fixation_points.append(fixation_point)
     irl_state.clip_scores.append(clip_score)
 
+    # Update belief map at the selected patch
     irl_state.belief_patch_map[y_idx, x_idx] = clip_score
     irl_state.history_patch_map[y_idx, x_idx] = 1.0
+    
+    # If CLIP score is high (good match), propagate to neighboring patches
+    # This helps guide future fixations toward the target object
+    if clip_score > 0.25:  # Threshold for "good match"
+        propagation_radius = 1  # Propagate to immediate neighbors
+        decay_factor = 0.7  # Neighbors get 70% of the score
+        
+        for dy in range(-propagation_radius, propagation_radius + 1):
+            for dx in range(-propagation_radius, propagation_radius + 1):
+                if dx == 0 and dy == 0:
+                    continue  # Skip center (already updated)
+                
+                ny = y_idx + dy
+                nx = x_idx + dx
+                
+                # Check bounds
+                if 0 <= ny < patch_num_y and 0 <= nx < patch_num_x:
+                    # Only update if current value is lower (don't overwrite better scores)
+                    neighbor_score = clip_score * decay_factor
+                    if neighbor_score > irl_state.belief_patch_map[ny, nx]:
+                        irl_state.belief_patch_map[ny, nx] = neighbor_score
 
     return irl_state
 
@@ -646,6 +729,8 @@ def run_active_vision_search(
     device: Optional[torch.device] = None,
     max_steps: Optional[int] = None,
     score_threshold: float = 0.3,
+    saliency_prior: Optional[np.ndarray] = None,
+    text_emb: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     """
     Run the ACTIVE IRL vision pipeline on a single image & text query.
@@ -706,15 +791,28 @@ def run_active_vision_search(
     if max_steps is None:
         max_steps = int(hparams.Data.max_traj_length)
 
+    if text_emb is None:
+        text_emb = encode_clip_query_embedding(
+            clip_model, clip_tokenizer, text_query, device
+        )
+
     # Initialize IRL state
     irl_state = initial_state(image, hparams, device)
+    if saliency_prior is not None:
+        seed_belief_from_saliency(irl_state, saliency_prior)
 
     # Main control loop
     for _ in range(max_steps):
         action_index, fixation_point = next_action(irl_state, irl_policy)
         patch = crop_patch(image, fixation_point, irl_state, scale_factor=1.5)
         clip_score = evaluate_patch_with_clip(
-            patch, text_query, clip_model, clip_preprocess, clip_tokenizer, device
+            patch,
+            text_query,
+            clip_model,
+            clip_preprocess,
+            clip_tokenizer,
+            device,
+            text_emb=text_emb,
         )
         irl_state = update_state(irl_state, action_index, fixation_point, clip_score)
 
@@ -731,6 +829,7 @@ __all__ = [
     "IRLState",
     "load_irl_policy",
     "initial_state",
+    "seed_belief_from_saliency",
     "next_action",
     "crop_patch",
     "evaluate_patch_with_clip",

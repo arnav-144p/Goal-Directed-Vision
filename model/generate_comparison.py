@@ -60,16 +60,19 @@ from interactive_search import (
     generate_saliency_map,
     generate_scanpath_from_saliency,
     highlight_object,
+    encode_clip_query_embedding,
 )
 from active_vision_irl import (
     load_irl_policy,
     initial_state,
+    seed_belief_from_saliency,
     next_action,
     crop_patch,
     evaluate_patch_with_clip,
     update_state,
     finalize_output,
 )
+from run_comparison import _refine_unified_bbox_with_clip
 
 
 @dataclass
@@ -120,32 +123,6 @@ def _ensure_dirs(root: str) -> Dict[str, str]:
         "passive_peaks": passive_peaks_dir,
         "active_fix_steps": active_fix_steps_dir,
     }
-
-
-def _compute_passive_bbox_from_saliency(
-    saliency_map: np.ndarray,
-    image_size: Tuple[int, int],
-    percentile: float = 90.0,
-) -> Tuple[float, float, float, float]:
-    """
-    Compute a bounding box from a saliency map by thresholding at a percentile.
-    """
-    img_w, img_h = image_size
-    if saliency_map.shape != (img_h, img_w):
-        # Resize to match image resolution
-        saliency_pil = Image.fromarray((saliency_map * 255).astype(np.uint8))
-        saliency_map = np.array(saliency_pil.resize((img_w, img_h))) / 255.0
-
-    thresh = np.percentile(saliency_map, percentile)
-    mask = saliency_map >= thresh
-    ys, xs = np.where(mask)
-    if len(xs) == 0 or len(ys) == 0:
-        # Fallback: centered box
-        return img_w * 0.25, img_h * 0.25, img_w * 0.75, img_h * 0.75
-
-    x_min, x_max = xs.min(), xs.max()
-    y_min, y_max = ys.min(), ys.max()
-    return float(x_min), float(y_min), float(x_max), float(y_max)
 
 
 def _save_passive_heatmap(
@@ -281,8 +258,15 @@ def run_passive(image_path: str, text_query: str) -> PassiveResult:
     highlight_object(image, saliency_resized, text_query, final_box_path)
     print(f"[PASSIVE] Final box visualization saved to {final_box_path}")
 
-    # Also compute bbox numerically for side-by-side overlay
-    bbox = _compute_passive_bbox_from_saliency(saliency_resized, image.size)
+    text_emb = encode_clip_query_embedding(model, tokenizer, text_query, device)
+    bbox = _refine_unified_bbox_with_clip(
+        image,
+        saliency_resized,
+        text_emb,
+        model,
+        preprocess,
+        device,
+    )
     scanpath = generate_scanpath_from_saliency(saliency_resized, image.size, num_fixations=7)
 
     return PassiveResult(
@@ -455,7 +439,12 @@ def _save_active_final_box(
     img.save(output_path)
 
 
-def run_active(image_path: str, text_query: str) -> ActiveResult:
+def run_active(
+    image_path: str,
+    text_query: str,
+    saliency_prior: Optional[np.ndarray] = None,
+    unified_bbox: Optional[Tuple[float, float, float, float]] = None,
+) -> ActiveResult:
     """
     Run the active IRL + CLIP pipeline and generate visualizations under
     `comparison/active/`.
@@ -490,6 +479,9 @@ def run_active(image_path: str, text_query: str) -> ActiveResult:
     )
     clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
     clip_model.eval()
+    text_emb = encode_clip_query_embedding(
+        clip_model, clip_tokenizer, text_query, device
+    )
 
     # Load IRL
     print("[ACTIVE] Loading IRL policy...")
@@ -498,6 +490,8 @@ def run_active(image_path: str, text_query: str) -> ActiveResult:
 
     # Initialize IRL state and run control loop manually so we can capture patches
     irl_state = initial_state(image, hparams, device)
+    if saliency_prior is not None:
+        seed_belief_from_saliency(irl_state, saliency_prior)
     max_steps = int(hparams.Data.max_traj_length)
     score_threshold = 0.3
 
@@ -514,6 +508,7 @@ def run_active(image_path: str, text_query: str) -> ActiveResult:
             clip_preprocess,
             clip_tokenizer,
             device,
+            text_emb=text_emb,
         )
         irl_state = update_state(irl_state, action_index, fixation_point, clip_score)
 
@@ -531,7 +526,11 @@ def run_active(image_path: str, text_query: str) -> ActiveResult:
     final_outputs = finalize_output(irl_state, score_threshold=score_threshold)
     fixation_points = final_outputs["fixation_points"]
     clip_scores = final_outputs["clip_scores"]
-    final_bbox = final_outputs["final_bbox"]
+    final_bbox = (
+        unified_bbox
+        if unified_bbox is not None
+        else final_outputs["final_bbox"]
+    )
 
     # (a) fixation step images
     print("[ACTIVE] Saving fixation step visualizations...")
@@ -547,7 +546,7 @@ def run_active(image_path: str, text_query: str) -> ActiveResult:
     _save_cumulative_attention(cumulative_attention, cumulative_attn_path)
     print(f"[ACTIVE] Cumulative attention saved to {cumulative_attn_path}")
 
-    # (d) final bounding box visualization
+    # (d) final bounding box visualization (same bbox as passive when unified_bbox set)
     final_box_path = os.path.join(active_dir, "active_final_box.png")
     _save_active_final_box(image, final_bbox, final_box_path)
     print(f"[ACTIVE] Final box visualization saved to {final_box_path}")
@@ -564,12 +563,15 @@ def generate_side_by_side(
     passive_result: PassiveResult,
     active_result: ActiveResult,
     image_path: str,
+    text_query: str = "object",
 ) -> None:
     """
     Generate a side-by-side comparison under `comparison/final/side_by_side.png`.
 
-    LEFT  = passive_final_box.png (with optional passive points in green)
-    RIGHT = active_final_box.png (with active fixations in purple)
+    Creates three panels:
+    LEFT   = Scanpath Visualization (active vision fixations with connecting lines)
+    MIDDLE = Detected Object (passive vision bounding box)
+    RIGHT  = Original Image
     """
     paths = _ensure_dirs(".")
     passive_dir = paths["passive"]
@@ -577,62 +579,96 @@ def generate_side_by_side(
     final_dir = paths["final"]
 
     passive_box_path = os.path.join(passive_dir, "passive_final_box.png")
-    active_box_path = os.path.join(active_dir, "active_final_box.png")
     side_by_side_path = os.path.join(final_dir, "side_by_side.png")
 
-    # Load the final box images we saved earlier
-    passive_img = Image.open(passive_box_path).convert("RGB")
-    active_img = Image.open(active_box_path).convert("RGB")
+    # Load original image
+    image = load_image(image_path)
+    img_w, img_h = image.size
 
-    # Ensure same height by resizing active to match passive height
-    p_w, p_h = passive_img.size
-    a_w, a_h = active_img.size
-    if a_h != p_h:
-        new_a_w = int(a_w * (p_h / a_h))
-        active_img = active_img.resize((new_a_w, p_h))
-        a_w, a_h = active_img.size
-
-    canvas_w = p_w + a_w
-    canvas_h = p_h
-    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(0, 0, 0))
-    canvas.paste(passive_img, (0, 0))
-    canvas.paste(active_img, (p_w, 0))
-
+    # Create a three-panel visualization
+    panel_w = img_w
+    panel_h = img_h
+    canvas_w = panel_w * 3
+    canvas_h = panel_h
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(255, 255, 255))
+    
     draw = ImageDraw.Draw(canvas)
 
-    # Add titles
+    # Panel 1: Scanpath Visualization (Active Vision)
+    canvas.paste(image, (0, 0))
+    
+    # Draw active vision scanpath with connecting lines
+    if active_result.fixation_points and len(active_result.fixation_points) > 0:
+        fixations = active_result.fixation_points
+        
+        # Draw connecting lines
+        for i in range(len(fixations) - 1):
+            x1, y1 = fixations[i]
+            x2, y2 = fixations[i + 1]
+            draw.line([(x1, y1), (x2, y2)], fill=(255, 0, 0), width=3)
+        
+        # Draw fixation points with numbers
+        for idx, (fx, fy) in enumerate(fixations, start=1):
+            # Draw point
+            r = 8
+            draw.ellipse(
+                (fx - r, fy - r, fx + r, fy + r),
+                fill=(255, 0, 0),
+                outline=(255, 255, 255),
+                width=2,
+            )
+            # Draw number
+            text = str(idx)
+            bbox = draw.textbbox((0, 0), text)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            draw.rectangle(
+                [fx + 10, fy - 10 - text_h, fx + 10 + text_w + 4, fy - 10],
+                fill=(0, 0, 0),
+                outline=None,
+            )
+            draw.text(
+                (fx + 12, fy - 10 - text_h),
+                text,
+                fill=(255, 255, 0),
+            )
+    
+    # Add title for Panel 1
     draw.text(
         (10, 10),
-        "PASSIVE CLIP",
-        fill=(0, 255, 0),
-        stroke_width=2,
+        "Scanpath Visualization",
+        fill=(255, 255, 255),
+        stroke_width=3,
         stroke_fill=(0, 0, 0),
     )
+
+    # Panel 2: Detected Object (Passive Vision)
+    passive_img = Image.open(passive_box_path).convert("RGB")
+    # Resize passive image to match panel size if needed
+    if passive_img.size != (panel_w, panel_h):
+        passive_img = passive_img.resize((panel_w, panel_h))
+    canvas.paste(passive_img, (panel_w, 0))
+    
+    # Add title for Panel 2
     draw.text(
-        (p_w + 10, 10),
-        "ACTIVE IRL",
-        fill=(186, 85, 211),  # medium orchid
-        stroke_width=2,
+        (panel_w + 10, 10),
+        f'Detected Object: "{text_query}"',
+        fill=(255, 255, 255),
+        stroke_width=3,
         stroke_fill=(0, 0, 0),
     )
 
-    # Overlay passive peak points (green) on the left half
-    for x, y in passive_result.peak_points:
-        r = 5
-        draw.ellipse(
-            (x - r, y - r, x + r, y + r),
-            outline=(0, 255, 0),
-            width=2,
-        )
-
-    # Overlay active fixations (purple) on the right half (offset by p_w)
-    for fx, fy in active_result.fixation_points:
-        r = 6
-        draw.ellipse(
-            (p_w + fx - r, fy - r, p_w + fx + r, fy + r),
-            outline=(186, 85, 211),
-            width=2,
-        )
+    # Panel 3: Original Image
+    canvas.paste(image, (panel_w * 2, 0))
+    
+    # Add title for Panel 3
+    draw.text(
+        (panel_w * 2 + 10, 10),
+        "Original Image",
+        fill=(255, 255, 255),
+        stroke_width=3,
+        stroke_fill=(0, 0, 0),
+    )
 
     canvas.save(side_by_side_path)
     print(f"[FINAL] Side-by-side comparison saved to {side_by_side_path}")
@@ -660,12 +696,17 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Run passive and active pipelines
+    # Run passive first (refined bbox + heatmap), then active with same CLIP prior
     passive_result = run_passive(args.image, args.query)
-    active_result = run_active(args.image, args.query)
+    active_result = run_active(
+        args.image,
+        args.query,
+        saliency_prior=passive_result.heatmap,
+        unified_bbox=passive_result.bbox,
+    )
 
     # Generate final side-by-side visualization
-    generate_side_by_side(passive_result, active_result, args.image)
+    generate_side_by_side(passive_result, active_result, args.image, args.query)
 
 
 if __name__ == "__main__":

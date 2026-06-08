@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.env
+
+# Model weights
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.ckpt
+models/*.safetensors
+
+# Outputs
+demo_outputs/
+comparison_output.png
+
+# OS
+.DS_Store
+Thumbs.db

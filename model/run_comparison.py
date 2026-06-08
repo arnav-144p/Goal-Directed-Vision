@@ -38,6 +38,7 @@ from interactive_search import (
     load_image,
     generate_saliency_map,
     generate_scanpath_from_saliency,
+    encode_clip_query_embedding,
 )
 from active_vision_irl import load_irl_policy, run_active_vision_search
 
@@ -84,6 +85,83 @@ def _compute_passive_bbox_from_saliency(
     x_min, x_max = xs.min(), xs.max()
     y_min, y_max = ys.min(), ys.max()
     return float(x_min), float(y_min), float(x_max), float(y_max)
+
+
+def _refine_unified_bbox_with_clip(
+    image: Image.Image,
+    saliency_map: np.ndarray,
+    text_emb: torch.Tensor,
+    clip_model: torch.nn.Module,
+    preprocess,
+    device: torch.device,
+) -> Tuple[float, float, float, float]:
+    """
+    Re-rank saliency-derived bbox candidates with CLIP on crops so passive and
+    active panels agree on one region for the same text query.
+    """
+    img_w, img_h = image.size
+    sm = saliency_map.astype(np.float32)
+    if sm.shape != (img_h, img_w):
+        from PIL import Image as PILImage
+
+        sm = np.array(
+            PILImage.fromarray((np.clip(sm, 0.0, 1.0) * 255).astype(np.uint8)).resize(
+                (img_w, img_h)
+            )
+        ) / 255.0
+
+    candidates: List[Tuple[float, float, float, float]] = []
+    for pct in (86.0, 88.0, 90.0, 91.0, 92.0, 93.0, 94.0):
+        candidates.append(
+            _compute_passive_bbox_from_saliency(sm, (img_w, img_h), percentile=pct)
+        )
+
+    flat = sm.reshape(-1)
+    k = min(24, flat.size)
+    idx = np.argpartition(flat, -k)[-k:]
+    ys, xs = np.unravel_index(idx, sm.shape)
+    win = max(28, min(img_w, img_h) // 10)
+    for x, y in zip(xs, ys):
+        x0 = max(0.0, float(x - win))
+        y0 = max(0.0, float(y - win))
+        x1 = min(float(img_w), float(x + win))
+        y1 = min(float(img_h), float(y + win))
+        if x1 - x0 > 4.0 and y1 - y0 > 4.0:
+            candidates.append((x0, y0, x1, y1))
+
+    seen = set()
+    uniq: List[Tuple[float, float, float, float]] = []
+    for b in candidates:
+        key = tuple(round(float(x), 1) for x in b)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(b)
+
+    def score_crop(b: Tuple[float, float, float, float]) -> float:
+        x0, y0, x1, y1 = b
+        bw, bh = x1 - x0, y1 - y0
+        pad_x = max(8.0, bw * 0.12)
+        pad_y = max(8.0, bh * 0.12)
+        l = max(0, int(x0 - pad_x))
+        t = max(0, int(y0 - pad_y))
+        r = min(img_w, int(x1 + pad_x))
+        btm = min(img_h, int(y1 + pad_y))
+        crop = image.crop((l, t, r, btm))
+        if crop.width < 2 or crop.height < 2:
+            return float("-inf")
+        tensor = preprocess(crop).unsqueeze(0).to(device)
+        with torch.no_grad():
+            ie = F.normalize(clip_model.encode_image(tensor), dim=-1)
+        return float((ie @ text_emb.T).squeeze().item())
+
+    best_box = uniq[0]
+    best_s = score_crop(best_box)
+    for b in uniq[1:]:
+        s = score_crop(b)
+        if s > best_s:
+            best_s = s
+            best_box = b
+    return best_box
 
 
 def _draw_bbox(
@@ -258,8 +336,16 @@ def run_comparison(
     passive_scanpath = generate_scanpath_from_saliency(
         saliency_resized, image.size, num_fixations=7
     )
-    passive_bbox = _compute_passive_bbox_from_saliency(
-        saliency_resized, image.size, percentile=90.0
+    text_emb = encode_clip_query_embedding(
+        clip_model, clip_tokenizer, text_query, torch_device
+    )
+    passive_bbox = _refine_unified_bbox_with_clip(
+        image,
+        saliency_resized,
+        text_emb,
+        clip_model,
+        clip_preprocess,
+        torch_device,
     )
 
     # ACTIVE pipeline: IRL policy + CLIP patches
@@ -279,7 +365,13 @@ def run_comparison(
         device=torch_device,
         max_steps=None,
         score_threshold=0.3,
+        saliency_prior=saliency_resized,
+        text_emb=text_emb,
     )
+
+    # One shared box so passive and active cannot disagree on localization
+    active_outputs = dict(active_outputs)
+    active_outputs["final_bbox"] = passive_bbox
 
     # Visualization
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)

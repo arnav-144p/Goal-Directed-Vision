@@ -2,6 +2,7 @@
 
 A goal-directed active vision agent that learns where to look — trained with Inverse Reinforcement Learning on human gaze data, outperforming passive scan baselines on the COCO-Search18 benchmark.
 
+
 ---
 
 ## Overview
